@@ -565,6 +565,19 @@ def page_update():
                         ["Todo", "Sólo spot", "Sólo futuros"],
                         horizontal=True)
 
+    # Info sobre el comportamiento de reintentos
+    if info is not None and not info.empty:
+        last_log = get_update_log(1)
+        if not last_log.empty and last_log.iloc[0].get("error"):
+            st.info(
+                "💡 **Para reintentar contratos fallidos**: desmarca "
+                "'Histórico completo' y pulsa Ejecutar. Sólo se descargarán "
+                "los contratos que faltan en la base de datos, no los que "
+                "ya están. El sistema prueba automáticamente ±7 días "
+                "alrededor de la expiración teórica para capturar contratos "
+                "con fechas inusuales."
+            )
+
     if st.button("▶ Ejecutar actualización", type="primary"):
         do_spot = only in ("Todo", "Sólo spot")
         do_fut = only in ("Todo", "Sólo futuros")

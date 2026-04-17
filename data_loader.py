@@ -29,23 +29,18 @@ from utils import VXContract
 
 logger = logging.getLogger(__name__)
 
-# User-agent realista y headers completos para evitar 403 de CBOE CDN
+# User-agent simple. El notebook original que funcionaba en Colab usa
+# requests.get sin headers personalizados. Un UA mínimo evita algunos
+# bloqueos sin triggerear otros.
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/17.0 Safari/605.1.15"
-    ),
-    "Accept": "text/csv,application/csv,application/octet-stream,*/*;q=0.9",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.cboe.com/us/futures/market_statistics/historical_data/",
-    "Origin": "https://www.cboe.com",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
+    "User-Agent": "Mozilla/5.0 (compatible; vix-analytics/1.0)",
 }
-_REQUEST_TIMEOUT = 30
+_REQUEST_TIMEOUT = 20
+# Offsets de búsqueda: CBOE guarda contratos por fecha real de expiración,
+# que puede diferir ±7 días de la fórmula teórica por festivos antiguos
+# o ajustes de calendario. Este patrón (tomado del notebook Colab que
+# funcionaba) es lo que permite encontrar todos los contratos.
+_EXPIRY_OFFSETS = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7]
 
 
 # -----------------------------------------------------------------------------
@@ -151,35 +146,38 @@ class CBOEFuturesSource(BaseFuturesSource):
     }
 
     def fetch_contract(self, contract: VXContract) -> pd.DataFrame:
-        """Intenta cada patrón de URL hasta que uno funcione."""
-        # Expiración en formato YYYY-MM-DD (patrón moderno CBOE)
-        expiry_str = contract.expiry.isoformat()
+        """
+        Descarga un contrato VX probando ±7 días alrededor de la expiración
+        teórica. Esto replica la estrategia del notebook Colab que funcionaba:
+        CBOE indexa sus CSVs por la fecha REAL de expiración (settlement),
+        que a veces difiere de la fórmula teórica por festivos o ajustes
+        antiguos de calendario.
+        """
+        import datetime as _dt
+        expiry = contract.expiry
 
-        urls = []
-        for pattern in CBOE_URL_PATTERNS:
-            try:
-                url = pattern.format(
-                    year=contract.year,
-                    month_code=contract.month_code,
-                    yy=contract.yy,
-                    expiry=expiry_str,
-                )
-                urls.append(url)
-            except KeyError:
-                continue
-
-        for url in urls:
+        for offset in _EXPIRY_OFFSETS:
+            try_date = expiry + _dt.timedelta(days=offset)
+            url = (f"https://cdn.cboe.com/data/us/futures/"
+                   f"market_statistics/historical_data/VX/"
+                   f"VX_{try_date.isoformat()}.csv")
             try:
                 df = self._try_download(url)
                 if df is not None and not df.empty:
-                    logger.info("Descargado %s desde %s (%d filas)",
-                                contract.code, url, len(df))
+                    if offset != 0:
+                        logger.info("Descargado %s en offset %+d días (%s)",
+                                    contract.code, offset, try_date)
+                    else:
+                        logger.info("Descargado %s (%d filas)",
+                                    contract.code, len(df))
                     return df
             except Exception as e:
-                logger.debug("Fallo %s: %s", url, e)
+                logger.debug("Offset %+d falló para %s: %s",
+                             offset, contract.code, e)
                 continue
 
-        logger.warning("No se pudo descargar %s desde CBOE", contract.code)
+        logger.warning("No se pudo descargar %s desde CBOE tras probar "
+                       "±7 días", contract.code)
         return pd.DataFrame()
 
     def _try_download(self, url: str) -> pd.DataFrame | None:
@@ -189,6 +187,12 @@ class CBOEFuturesSource(BaseFuturesSource):
         resp.raise_for_status()
 
         text = resp.text
+        # Validación mínima (como el notebook Colab): longitud y presencia
+        # de la cabecera "Trade Date" indica que es CSV válido y no una
+        # página de error.
+        if len(text) < 100 or "trade date" not in text.lower():
+            return None
+
         lines = text.splitlines()
         header_idx = 0
         for i, ln in enumerate(lines):
@@ -200,6 +204,9 @@ class CBOEFuturesSource(BaseFuturesSource):
         df = pd.read_csv(io.StringIO(clean_csv))
         if df.empty:
             return df
+
+        # Limpiar nombres con posibles espacios extra (CBOE a veces)
+        df.columns = df.columns.str.strip()
 
         df = df.rename(columns={k: v for k, v in self.CSV_COLUMNS_MAP.items()
                                 if k in df.columns})
