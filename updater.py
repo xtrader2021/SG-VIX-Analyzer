@@ -141,17 +141,19 @@ def _determine_contracts_to_update(full_history: bool) -> tuple[list[VXContract]
     today = last_business_day()
     start_date = dt.date.fromisoformat(HISTORY_START_DATE)
 
-    # Todos los contratos con expiración en [start_date, today+400d]
+    # CBOE lista típicamente 9 vencimientos consecutivos a la vez (front
+    # month + 8 siguientes). Generamos hasta ~10 meses por delante para
+    # cubrir con margen sin intentar contratos que aún no existen.
     all_contracts = generate_contracts_between(
-        start_date, today + dt.timedelta(days=400)
+        start_date, today + dt.timedelta(days=300)
     )
 
     # Activos = expiración >= hoy
     active = [c for c in all_contracts if c.expiry >= today]
     expired = [c for c in all_contracts if c.expiry < today]
 
-    # Activos: siempre actualizar (son pocos, <10)
-    to_update_incremental = active[:MAX_CONTINUOUS_MONTHS + 4]
+    # Activos: tomar los primeros 9 vencimientos (lo que CBOE realmente lista)
+    to_update_incremental = active[:9]
     # Los que estén expirados pero sin datos locales hay que descargarlos
     # completos. Si full_history=True, descargar todos.
     info = get_all_contracts_info()
