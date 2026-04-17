@@ -396,3 +396,172 @@ def auto_interpretation(df_spot: pd.DataFrame,
             )
 
     return lines
+
+
+# -----------------------------------------------------------------------------
+# SPREADS PERSONALIZADOS (multi-pata, con pesos)
+# -----------------------------------------------------------------------------
+def compute_custom_spread(df_futures_long: pd.DataFrame,
+                          df_spot: pd.DataFrame,
+                          legs: list[dict]) -> pd.DataFrame:
+    """
+    Calcula un spread/butterfly personalizado con múltiples patas y pesos.
+
+    Args:
+        df_futures_long: formato largo con columnas [date, settle, dte, ...]
+        df_spot: spot con 'vix'
+        legs: lista de {'month': int (1-8), 'weight': float}
+              Ej. M1-M2 → [{'month':1,'weight':1}, {'month':2,'weight':-1}]
+              Ej. Fly 1-2-3 → [{'month':1,'weight':1}, {'month':2,'weight':-2}, {'month':3,'weight':1}]
+
+    Devuelve DataFrame con [date, spread, dte_front, vix, year, monthDay].
+    """
+    if df_futures_long is None or df_futures_long.empty or not legs:
+        return pd.DataFrame()
+
+    df = df_futures_long.copy()
+    df = df.dropna(subset=["settle"])
+    df = df[df["settle"] > 0]
+    # month_rank: M1 = contrato con menor DTE positivo ese día, M2 siguiente, etc.
+    df = df.sort_values(["date", "dte"])
+    df["month_rank"] = df.groupby("date").cumcount() + 1
+
+    # Para cada pata, extraer la serie correspondiente al month_rank
+    leg_series = []
+    for i, leg in enumerate(legs):
+        m = leg["month"]
+        w = leg["weight"]
+        leg_df = df[df["month_rank"] == m][["date", "settle", "dte"]].rename(
+            columns={"settle": f"settle_{i}", "dte": f"dte_{i}"})
+        leg_series.append((leg_df, w, i))
+
+    # Merge inner: solo fechas donde están todas las patas
+    result = leg_series[0][0]
+    for leg_df, _, _ in leg_series[1:]:
+        result = result.merge(leg_df, on="date", how="inner")
+
+    if result.empty:
+        return pd.DataFrame()
+
+    # Calcular spread ponderado
+    result["spread"] = sum(
+        legs[i]["weight"] * result[f"settle_{i}"]
+        for i in range(len(legs))
+    )
+
+    # DTE del front (pata más cercana)
+    dte_cols = [f"dte_{i}" for i in range(len(legs))]
+    result["dte_front"] = result[dte_cols].min(axis=1)
+
+    # Merge con spot
+    if df_spot is not None and not df_spot.empty and "vix" in df_spot.columns:
+        spot = df_spot[["vix"]].reset_index()
+        spot["date"] = pd.to_datetime(spot["date"])
+        result = result.merge(spot, on="date", how="left")
+    else:
+        result["vix"] = np.nan
+
+    result["date"] = pd.to_datetime(result["date"])
+    result["year"] = result["date"].dt.year
+    result["monthDay"] = result["date"].dt.strftime("%m-%d")
+
+    return result[["date", "spread", "dte_front", "vix", "year", "monthDay"]]
+
+
+def formula_string(legs: list[dict]) -> str:
+    """Construye cadena 'M1 − M2' o '+M1 −2M2 +M3' etc."""
+    parts = []
+    for leg in legs:
+        w = leg["weight"]
+        m = f"M{leg['month']}"
+        if w == 1:
+            parts.append(f"+{m}")
+        elif w == -1:
+            parts.append(f"−{m}")
+        elif w > 0:
+            parts.append(f"+{w:g}{m}")
+        else:
+            parts.append(f"{w:g}{m}")
+    return " ".join(parts).lstrip("+").strip()
+
+
+def spread_valuation(spread_series: pd.Series,
+                     current_value: float | None = None,
+                     similar_mask: pd.Series | None = None) -> dict:
+    """
+    Devuelve métricas de valoración de un spread:
+      - valor actual
+      - percentil full-sample
+      - percentil rolling 3Y
+      - z-score 252d
+      - percentil condicional (si similar_mask se pasa)
+      - clasificación textual (señal)
+
+    Args:
+        spread_series: serie temporal del spread (indexed by date)
+        current_value: valor a evaluar (default: último)
+        similar_mask: bool mask para calcular percentil condicional
+    """
+    if spread_series.empty:
+        return {}
+
+    s = spread_series.dropna()
+    if s.empty:
+        return {}
+
+    if current_value is None:
+        current_value = s.iloc[-1]
+
+    # Percentil full sample
+    pct_full = (s < current_value).mean() * 100
+
+    # Percentil rolling 3Y (756 días)
+    pct_rolling = np.nan
+    if len(s) >= 60:
+        window = min(len(s), ROLLING_PERCENTILE_WINDOW_DAYS)
+        recent = s.iloc[-window:]
+        pct_rolling = (recent < current_value).mean() * 100
+
+    # Z-score 252d
+    zscore = np.nan
+    if len(s) >= 60:
+        window = min(len(s), ROLLING_ZSCORE_WINDOW_DAYS)
+        recent = s.iloc[-window:]
+        mu = recent.mean()
+        sd = recent.std()
+        if sd > 0:
+            zscore = (current_value - mu) / sd
+
+    # Percentil condicional (ej: días con VIX similar)
+    pct_conditional = np.nan
+    if similar_mask is not None:
+        cond = s[similar_mask.reindex(s.index, fill_value=False)]
+        if len(cond) >= 20:
+            pct_conditional = (cond < current_value).mean() * 100
+
+    # Clasificación (5 niveles)
+    ref_pct = pct_rolling if pd.notna(pct_rolling) else pct_full
+    if ref_pct < 10:
+        signal = "EXTREMO BARATO"
+    elif ref_pct < 30:
+        signal = "BARATO"
+    elif ref_pct < 70:
+        signal = "NEUTRAL"
+    elif ref_pct < 90:
+        signal = "CARO"
+    else:
+        signal = "EXTREMO CARO"
+
+    return {
+        "current": float(current_value),
+        "pct_full": float(pct_full),
+        "pct_rolling": float(pct_rolling) if pd.notna(pct_rolling) else None,
+        "zscore": float(zscore) if pd.notna(zscore) else None,
+        "pct_conditional": float(pct_conditional) if pd.notna(pct_conditional) else None,
+        "signal": signal,
+        "n_observations": len(s),
+        "mean": float(s.mean()),
+        "std": float(s.std()) if len(s) > 1 else 0.0,
+        "min": float(s.min()),
+        "max": float(s.max()),
+    }
